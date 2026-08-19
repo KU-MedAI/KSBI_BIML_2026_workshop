@@ -1,0 +1,1037 @@
+# GSEApy example notebook
+
+- id: gseapy
+- package: gseapy
+- modality: transcriptomics
+- kind: tutorial
+- source_url: https://raw.githubusercontent.com/zqfang/GSEApy/master/docs/gseapy_example.ipynb
+- final_url: https://raw.githubusercontent.com/zqfang/GSEApy/master/docs/gseapy_example.ipynb
+- fetched_at: 2026-06-26T04:22:22.228377+00:00
+- license_note: Documentation page; store extracted text for internal RAG use.
+
+# GSEApy Tutorial
+
+[**GSEApy**](https://github.com/zqfang/GSEApy) is a Python/Rust toolkit for
+**Gene Set Enrichment Analysis** and related methods. This notebook walks through
+every public entry point with small, runnable demos using the data bundled in the
+repository's `tests/` folder.
+
+### What this notebook covers
+
+| Section | Function | What it does |
+| --- | --- | --- |
+| 1. Setup | — | imports and version check |
+| 2. Biomart | `Biomart` | convert gene IDs, map orthologs between species |
+| 3. MSigDB | `Msigdb` | download MSigDB gene-set collections (`.gmt`) |
+| 4. Enrichr libraries | `get_library_name`, `get_library` | list / fetch Enrichr gene-set libraries |
+| 5. Over-representation (online) | `enrichr` | Enrichr web service |
+| 6. Over-representation (offline) | `enrich` | local hypergeometric test |
+| 7. Preranked GSEA | `prerank` | GSEA on a single ranked list |
+| 8. Standard GSEA | `gsea` | phenotype-permutation GSEA |
+| 9. ssGSEA | `ssgsea` | single-sample GSEA |
+| 10. GSVA | `gsva` | gene set variation analysis |
+| 11. Replot | `replot` | re-plot results from the Broad GSEA Java app |
+
+> **Tip:** run the cells in order. Sections 2–5 call online services
+> (Biomart, MSigDB, Enrichr) and need an internet connection; everything else
+> runs fully offline on the bundled test data.
+
+## Setup
+
+Import GSEApy together with pandas and matplotlib. The two `%autoreload` magics
+are only useful if you are editing the GSEApy source while you work — they reload
+changed modules automatically. They are harmless otherwise.
+
+
+```python
+# %matplotlib inline
+# %config InlineBackend.figure_format = 'retina' # crisper figures on HiDPI/Mac screens
+%load_ext autoreload
+%autoreload 2
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import gseapy as gp
+```
+
+
+Check the installed GSEApy version (this tutorial targets v1.x).
+
+
+```python
+gp.__version__
+```
+
+
+## Biomart API
+
+`Biomart` is a thin client over the Ensembl BioMart web service. Use it to
+**convert gene identifiers** (Ensembl ID ↔ gene symbol ↔ Entrez ID) and to
+**map orthologs between species**.
+
+> **Note:** BioMart support is limited and the public server can be slow or
+> occasionally unavailable. Skip this section if you do not need ID conversion.
+
+### Convert gene identifiers
+
+
+```python
+from gseapy import Biomart
+
+bm = Biomart()
+```
+
+
+```python
+# The commented helpers below let you discover valid marts/datasets/attributes/filters.
+# Run them once to explore, then build your real query.
+# marts = bm.get_marts() # available marts
+# datasets = bm.get_datasets(mart='ENSEMBL_MART_ENSEMBL') # datasets in a mart
+# attrs = bm.get_attributes(dataset='hsapiens_gene_ensembl') # columns you can request
+# filters = bm.get_filters(dataset='hsapiens_gene_ensembl') # columns you can filter on
+
+# A query needs: a dataset, the attributes (columns) to return, and optional filters.
+# `filters` must be a dict mapping a filter name to the values to keep.
+queries = {'ensembl_gene_id': ['ENSG00000125285', 'ENSG00000182968']}
+
+results = bm.query(
+ dataset='hsapiens_gene_ensembl',
+ attributes=['ensembl_gene_id', 'external_gene_name', 'entrezgene_id', 'go_id'],
+ filters=queries,
+)
+results.tail()
+```
+
+
+Inspect the column types of the returned table.
+
+
+```python
+results.dtypes
+```
+
+
+### Map gene symbols between mouse and human
+
+This is handy when you need to translate gene symbols across species — for
+example, to run a human gene-set library against mouse data. We pull the full
+ortholog mapping in both directions (no filter ⇒ all genes), so each query
+returns the whole genome and may take a little while.
+
+
+```python
+from gseapy import Biomart
+
+bm = Biomart()
+
+# Mouse -> Human orthologs. Note the dataset and attribute names differ per direction.
+m2h = bm.query(
+ dataset='mmusculus_gene_ensembl',
+ attributes=['ensembl_gene_id', 'external_gene_name',
+ 'hsapiens_homolog_ensembl_gene',
+ 'hsapiens_homolog_associated_gene_name'],
+)
+
+# Human -> Mouse orthologs.
+h2m = bm.query(
+ dataset='hsapiens_gene_ensembl',
+ attributes=['ensembl_gene_id', 'external_gene_name',
+ 'mmusculus_homolog_ensembl_gene',
+ 'mmusculus_homolog_associated_gene_name'],
+)
+```
+
+
+```python
+# Peek at a random sample of the human -> mouse mapping.
+h2m.sample(5)
+```
+
+
+### Translate a `.gmt` gene-set file to another species
+
+GSEApy gene symbols are case-sensitive when used offline, and most public
+libraries (Enrichr, MSigDB) ship **human** symbols. To run them against mouse
+data, convert the gene members with the ortholog map built above.
+
+**Example: convert a human KEGG library to mouse symbols.**
+
+
+```python
+# Build a {human_symbol: mouse_symbol} lookup, dropping rows with missing values.
+h2m_dict = {}
+for _, row in h2m[['external_gene_name', 'mmusculus_homolog_associated_gene_name']].iterrows():
+ if row.isna().any():
+ continue
+ h2m_dict[row['external_gene_name']] = row['mmusculus_homolog_associated_gene_name']
+
+# Read a human KEGG .gmt into a {term: [genes]} dict.
+kegg = gp.read_gmt(path="tests/extdata/enrichr.KEGG_2016.gmt")
+print("Human symbols:", kegg['MAPK signaling pathway Homo sapiens hsa04010'][:10])
+```
+
+
+```python
+# Translate every gene in every term to its mouse ortholog (skip genes with no mapping).
+kegg_mouse = {}
+for term, genes in kegg.items():
+ kegg_mouse[term] = [h2m_dict[g] for g in genes if g in h2m_dict]
+
+print("Mouse symbols:", kegg_mouse['MAPK signaling pathway Homo sapiens hsa04010'][:10])
+```
+
+
+## MSigDB API
+
+`Msigdb` downloads gene-set collections from the
+[MSigDB](https://www.gsea-msigdb.org/gsea/msigdb) (Broad Institute). You pick a
+`category` (e.g. hallmark, curated, GO) and a database version (`dbver`), and get
+back a `{term: [genes]}` dict ready to pass to any GSEApy function.
+
+
+```python
+from gseapy import Msigdb
+
+msig = Msigdb()
+# Mouse hallmark gene sets (category 'mh.all') from the 2023.1.Mm release.
+gmt = msig.get_gmt(category='mh.all', dbver="2023.1.Mm")
+```
+
+
+Two helpers let you discover valid values before downloading:
+
+```python
+msig.list_dbver() # list available database versions
+msig.list_category(dbver="2023.1.Hs") # list categories for a given version
+```
+
+
+```python
+# Inspect one hallmark set.
+print(gmt['HALLMARK_WNT_BETA_CATENIN_SIGNALING'])
+```
+
+
+## Enrichr gene-set libraries
+
+[Enrichr](https://maayanlab.cloud/Enrichr/) hosts hundreds of curated gene-set
+libraries. GSEApy can list them and download any of them as a `{term: [genes]}`
+dict for use with `enrichr`, `enrich`, `prerank`, `gsea`, `ssgsea`, or `gsva`.
+
+**List the available library names.**
+
+Choose the organism from: `'Human'`, `'Mouse'`, `'Yeast'`, `'Fly'`, `'Fish'`,
+`'Worm'`.
+
+
+```python
+# Default organism is Human.
+names = gp.get_library_name()
+names[:10]
+```
+
+
+```python
+# Library names differ per organism.
+yeast = gp.get_library_name(organism='Yeast')
+yeast[:10]
+```
+
+
+**Download a library into a `{term: [genes]}` dict.**
+
+
+```python
+# Fetch one library by name (or pass a local .gmt path to read_gmt instead).
+go_mf = gp.get_library(name='GO_Molecular_Function_2018', organism='Yeast')
+print(go_mf['ATP binding (GO:0005524)'])
+```
+
+
+## Over-representation analysis (Enrichr web service)
+
+`gp.enrichr()` sends a gene list to the Enrichr web service and returns enrichment
+results. The only required input is a list of gene **symbols**.
+
+**Accepted inputs**
+
+- `gene_list`: a `list`, `pandas.Series`, single-column `DataFrame`, or a `.txt`
+ file with one gene symbol per line.
+- `gene_sets`: one or more Enrichr library names (comma-separated string or list),
+ a local `.gmt` path, or a `{term: [genes]}` dict.
+
+```python
+gene_list = "./data/gene_list.txt" # or a Python list / Series
+gene_sets = "KEGG_2016" # one library
+gene_sets = "KEGG_2016,KEGG_2013" # several, comma-separated
+gene_sets = ["KEGG_2016", "KEGG_2013"] # several, as a list
+```
+
+> **Note:** for the online service, gene symbols are **not** case-sensitive — they
+> are upper-cased automatically.
+
+
+```python
+# Load an example gene list (one symbol per line).
+gene_list = pd.read_csv("./tests/data/gene_list.txt", header=None, sep="\t")
+gene_list.head()
+```
+
+
+```python
+# A DataFrame/Series can be flattened to a plain Python list if you prefer.
+glist = gene_list.squeeze().str.strip().to_list()
+print(glist[:10])
+```
+
+
+### Enrichr without a custom background
+
+Set `outdir=None` to keep results in memory only (nothing written to disk). The
+returned object stores the table on both `.res2d` (last query) and `.results`
+(all queries).
+
+
+```python
+enr = gp.enrichr(
+ gene_list=gene_list, # or "./tests/data/gene_list.txt"
+ gene_sets=['MSigDB_Hallmark_2020', 'KEGG_2021_Human'],
+ organism='human', # set to your organism, e.g. 'Yeast'
+ outdir=None, # keep results in memory only
+)
+```
+
+
+```python
+# All enrichment results across the requested libraries.
+enr.results.head(5)
+```
+
+
+### Enrichr with a custom background
+
+Provide your own background gene list (e.g. all genes expressed in your assay).
+
+> **Note:** when a background is supplied, the output omits the `Overlap` column.
+
+
+```python
+enr_bg = gp.enrichr(
+ gene_list=gene_list,
+ gene_sets=['MSigDB_Hallmark_2020', 'KEGG_2021_Human'],
+ background="tests/data/background.txt", # the 'organism' arg is ignored when set
+ outdir=None,
+)
+```
+
+
+```python
+enr_bg.results.head()
+```
+
+
+## Over-representation analysis (offline hypergeometric test)
+
+`gp.enrich()` runs the same over-representation test **locally** — it does **not**
+call the Enrichr web service. Use it for custom or private gene sets, or when you
+have no internet access.
+
+> **Important**
+> 1. Input gene symbols are **case-sensitive** here.
+> 2. The identifier type in your `gene_list` must match the one used in the
+> gene sets (`.gmt`/dict).
+> 3. `gene_sets` accepts a `.gmt` path or a `{term: [genes]}` dict:
+>
+> ```python
+> gene_sets = "./data/genes.gmt"
+> gene_sets = {'A': ['gene1', 'gene2', ...], 'B': ['gene2', 'gene4', ...]}
+> ```
+
+
+```python
+# Note: the offline function is `enrich` (no trailing "r"), unlike the online `enrichr`.
+# gene_sets here mixes a .gmt file, a name that won't resolve ("unknown"), and a dict (kegg).
+enr2 = gp.enrich(
+ gene_list="./tests/data/gene_list.txt", # or a Python list
+ gene_sets=["./tests/data/genes.gmt", "unknown", kegg],
+ background=None, # None | int | gene list | text file | a Biomart dataset name
+ outdir=None,
+ verbose=True,
+)
+```
+
+
+```python
+enr2.results.head()
+```
+
+
+### Choosing a background for the offline test
+
+By default, **all genes in `gene_sets`** are used as the background. A more
+accurate background is usually one of the following:
+
+1. **(Recommended) A list of background genes**, `['gene1', 'gene2', ...]` —
+ typically the genes detectable in your experiment (e.g. expressed genes from
+ your RNA-seq). The identifier type must match the gene sets.
+2. **A total gene count**, e.g. `20000`. Simple, but it assumes every gene set
+ gene is present in the background; genes in the sets but missing from the
+ background still distort the test.
+3. **A BioMart dataset name**, e.g. `"hsapiens_gene_ensembl"`. GSEApy fetches all
+ annotated genes for that dataset and uses them as the background.
+
+### Plotting enrichment results
+
+`dotplot` and `barplot` summarize an enrichment table. Below we show the top 5
+terms per library, ranked by adjusted p-value.
+
+
+```python
+from gseapy import barplot, dotplot
+```
+
+
+```python
+# Dot plot: dot size encodes gene overlap, color encodes significance.
+# Setting x='Gene_set' faces the plot by library so you can compare them side by side.
+ax = dotplot(
+ enr.results,
+ column="Adjusted P-value",
+ x='Gene_set', # split the x-axis by library (multi-library comparison)
+ size=5,
+ top_term=5,
+ figsize=(3, 5),
+ title="KEGG",
+ xticklabels_rot=45, # rotate x tick labels for readability
+ show_ring=True, # set False to remove the outer ring around dots
+ marker='o',
+)
+```
+
+
+```python
+# Bar plot grouped by library, with an explicit color per group.
+ax = barplot(
+ enr.results,
+ column="Adjusted P-value",
+ group='Gene_set', # group bars by library (multi-library comparison)
+ size=5,
+ top_term=5,
+ figsize=(3, 5),
+ color={'KEGG_2021_Human': 'salmon', 'MSigDB_Hallmark_2020': 'darkblue'},
+)
+```
+
+
+```python
+# Single-library views use .res2d (the most recent query).
+# Pass ofname='figure.pdf' to save the figure to disk.
+ax = dotplot(enr.res2d, title='KEGG_2021_Human', cmap='viridis', size=5, figsize=(3, 5))
+```
+
+
+```python
+ax = barplot(enr.res2d, title='KEGG_2021_Human', figsize=(4, 5), color='darkred')
+```
+
+
+### Command-line equivalent
+
+The same analysis is available from the `gseapy enrichr` CLI. The `-v` flag prints
+progress.
+
+
+```python
+# !gseapy enrichr -i ./tests/data/gene_list.txt \
+# -g GO_Biological_Process_2017 \
+# -v -o test/enrichr_BP
+```
+
+
+## Preranked GSEA (`prerank`)
+
+`gp.prerank()` runs GSEA on a **single, pre-ranked gene list** — for example, genes
+ranked by a differential-expression statistic.
+
+**Accepted `rnk` inputs**
+
+- a 2-column `DataFrame` (gene, score), or a 1-column `DataFrame` indexed by gene
+- a `pandas.Series` indexed by gene
+- a `.rnk` text file (no header; anything after a `#` is ignored)
+
+**Accepted `gene_sets` inputs** — same as the other functions: Enrichr library
+name(s), a `.gmt` path, or a `{term: [genes]}` dict.
+
+> **Note on symbols:** Enrichr libraries use **UPPERCASE** human symbols. Convert
+> your gene identifiers to match (see Section 2.3 for cross-species conversion).
+
+
+```python
+# A .rnk file: column 0 = gene, column 1 = ranking metric.
+rnk = pd.read_csv("./tests/data/temp.rnk", header=None, index_col=0, sep="\t")
+rnk.head()
+```
+
+
+```python
+rnk.shape
+```
+
+
+### Run prerank
+
+`permutation_num` is reduced to 1000 here to keep the demo fast. `outdir=None`
+keeps everything in memory. We use `method='multilevel'` (the fgsea multilevel
+p-value, explained just below); the default is `method='permutation'`.
+
+
+```python
+pre_res2 = gp.prerank(
+ rnk="./tests/data/temp.rnk", # or rnk=rnk
+ gene_sets='KEGG_2016', # Enrichr library name (downloaded automatically)
+ threads=4,
+ min_size=5,
+ max_size=1000,
+ permutation_num=1000, # raise for publication-quality p-values
+ outdir=None,
+ seed=6, # set a seed for reproducibility
+ method='multilevel', # fgsea multilevel p-values (see below)
+ verbose=True,
+)
+pre_res2.res2d.head(5)
+```
+
+
+For the comparison later in this section, also run the **default permutation**
+method on the same ranking.
+
+
+```python
+pre_res = gp.prerank(
+ rnk="./tests/data/temp.rnk",
+ gene_sets='KEGG_2016',
+ threads=4,
+ min_size=5,
+ max_size=1000,
+ permutation_num=1000,
+ outdir=None,
+ seed=6,
+ # method='permutation' is the default
+ verbose=True,
+)
+pre_res.res2d.head(5)
+```
+
+
+### The fgsea multilevel method
+
+With the default gene-permutation method, the smallest reportable nominal
+*p*-value is bounded by `1 / permutation_num`. Passing **`method='multilevel'`**
+switches to GSEApy's faithful Rust port of the
+[**fgsea**](https://github.com/ctlab/fgsea) multilevel algorithm, which resolves
+*p*-values far below `1/nperm` (down to `eps`) via adaptive split-sampling.
+
+Things to keep in mind:
+
+- It runs on a **single ranked list**, like classic preranked GSEA.
+- The **NES is fgsea-style**: `NES = ES / mean(|null ES| of the same sign)`, where
+ the null comes from random gene sets. This differs from the gene-permutation NES,
+ so NES values are **not directly comparable** between the two methods.
+- An extra **`log2err`** column reports the estimated log2 standard error of the
+ multilevel *p*-value.
+
+
+```python
+pre_mult = gp.prerank(
+ rnk="./tests/data/temp.rnk", # single ranked list
+ gene_sets="KEGG_2016",
+ method="multilevel", # use fgsea multilevel p-values
+ sample_size=101, # multilevel sampling depth (default 101)
+ eps=1e-50, # smallest p-value resolved; 0 => machine precision
+ threads=4,
+ min_size=5,
+ max_size=1000,
+ seed=6,
+ outdir=None,
+)
+pre_mult.res2d.head()
+```
+
+
+`pre_mult.res2d` carries the usual preranked columns plus `log2err`, and drops the
+`FWER p-val` column (that statistic is specific to the gene-permutation null):
+
+| Column | Meaning |
+| --- | --- |
+| `ES` / `NES` | enrichment score and fgsea-style normalized ES |
+| `NOM p-val` | multilevel nominal *p*-value (can be far below `1/nperm`) |
+| `FDR q-val` | Benjamini–Hochberg adjusted *p*-value |
+| `log2err` | estimated log2 standard error of the multilevel *p*-value |
+| `Tag %` / `Gene %` | leading-edge tag and gene fractions |
+| `Lead_genes` | leading-edge gene members |
+
+
+```python
+# Compare the permutation run (pre_res) against the multilevel run (pre_mult) on
+# the same ranking. The NES columns are on different scales between methods, but
+# the multilevel NOM p-val resolves far below 1/permutation_num (here 1e-3),
+# exposing tails the permutation null cannot reach.
+cols = ["Term", "NES", "NOM p-val", "FDR q-val"]
+cmp = pre_res.res2d[cols].merge(
+ pre_mult.res2d[cols], on="Term", suffixes=("_perm", "_multilevel")
+)
+cmp.sort_values("FDR q-val_multilevel").head(10)
+```
+
+
+#### Tuning `sample_size` and `eps`
+
+- **`sample_size`** (default `101`) — samples drawn per multilevel level. Larger
+ values reduce the variance of very small *p*-values (smaller `log2err`) at the
+ cost of runtime.
+- **`eps`** (default `1e-50`) — lower bound on resolvable *p*-values; anything
+ below `eps` is reported as `eps`. Set **`eps=0`** to push to machine precision
+ (slowest, most accurate tails).
+
+#### Command-line equivalent
+
+The multilevel method is exposed by the `gseapy prerank` CLI via `--method`,
+`--sample-size`, and `--eps`.
+
+
+```python
+# !gseapy prerank -r ./tests/data/temp.rnk -g KEGG_2016 \
+# --method multilevel --sample-size 101 --eps 1e-50 \
+# --min-size 5 --max-size 1000 --threads 4 \
+# -o prerank_multilevel_report
+```
+
+
+### GSEA enrichment plots
+
+Visualize the running enrichment score with `obj.plot()` (or the standalone
+`gseaplot` / `gseaplot2` helpers). Pass `ofname='figure.pdf'` to save to disk.
+
+
+```python
+pre_res.res2d.head(5)
+```
+
+
+```python
+# Plot a single term by name. obj.plot() is the convenient wrapper (v1.0.5+).
+terms = pre_res.res2d.Term
+axs = pre_res.plot(terms=terms[1])
+
+# For finer control, use the standalone helper:
+# from gseapy import gseaplot
+# gseaplot(rank_metric=pre_res.ranking, term=terms[0],
+# ofname='your.plot.pdf', **pre_res.results[terms[0]])
+```
+
+
+Plot several pathways together in one figure.
+
+
+```python
+axs = pre_res.plot(
+ terms=terms[1:5],
+ show_ranking=True, # show the ranking metric on a secondary y-axis
+ figsize=(3, 4),
+ # legend_kws={'loc': (1.2, 0)}, # reposition the legend if needed
+)
+
+# Equivalent low-level call:
+# from gseapy import gseaplot2
+# terms = pre_res.res2d.Term[1:5]
+# hits = [pre_res.results[t]['hits'] for t in terms]
+# runes = [pre_res.results[t]['RES'] for t in terms]
+# fig = gseaplot2(terms=terms, ress=runes, hits=hits,
+# rank_metric=pre_res.ranking, figsize=(4, 5))
+```
+
+
+`dotplot` also works on GSEA results.
+
+
+```python
+from gseapy import dotplot
+
+ax = dotplot(
+ pre_res.res2d,
+ column="FDR q-val",
+ title='KEGG_2016',
+ cmap=plt.cm.viridis,
+ size=6, # dot size scaling
+ figsize=(4, 5),
+ cutoff=0.25, # only show terms with FDR q-val <= cutoff
+ show_ring=False,
+)
+```
+
+
+### Network visualization (enrichment map)
+
+`enrichment_map` builds a network where nodes are enriched terms and edges connect
+terms that share genes. It returns `nodes` and `edges` DataFrames that you can also
+export for [Cytoscape](https://cytoscape.org/).
+
+
+```python
+from gseapy import enrichment_map
+
+# Returns two DataFrames: node table and edge table.
+nodes, edges = enrichment_map(pre_res.res2d)
+```
+
+
+```python
+import networkx as nx
+```
+
+
+```python
+# Build a graph from the edge table; carry similarity coefficients as edge attributes.
+G = nx.from_pandas_edgelist(
+ edges,
+ source='src_idx',
+ target='targ_idx',
+ edge_attr=['jaccard_coef', 'overlap_coef', 'overlap_genes'],
+)
+```
+
+
+```python
+fig, ax = plt.subplots(figsize=(8, 8))
+
+# Lay out the nodes.
+pos = nx.layout.spiral_layout(G)
+
+# Nodes: color by NES, size by the fraction of genes hit.
+nx.draw_networkx_nodes(
+ G, pos=pos,
+ cmap=plt.cm.RdYlBu,
+ node_color=list(nodes.NES),
+ node_size=list(nodes.Hits_ratio * 1000),
+)
+# Node labels (term names).
+nx.draw_networkx_labels(G, pos=pos, labels=nodes.Term.to_dict())
+
+# Edges: width proportional to Jaccard similarity.
+edge_weight = nx.get_edge_attributes(G, 'jaccard_coef').values()
+nx.draw_networkx_edges(
+ G, pos=pos,
+ width=list(map(lambda x: x * 10, edge_weight)),
+ edge_color='#CDDBD4',
+)
+plt.show()
+```
+
+
+#### Command-line equivalent
+
+
+```python
+# !gseapy prerank -r temp.rnk -g temp.gmt -o prerank_report_temp
+```
+
+
+## Standard GSEA (`gsea`)
+
+`gp.gsea()` runs the classic GSEA on an **expression matrix** with **phenotype
+labels**, computing the ranking metric and a phenotype-permutation null internally.
+
+**Accepted inputs**
+
+- `data`: a `DataFrame` (genes × samples), a `.gct` file, or a tab-delimited text file.
+- `cls`: a `.cls` file, or a Python list of class labels (one per sample).
+- `gene_sets`: an Enrichr library name, a `.gmt` path, or a `{term: [genes]}` dict.
+
+> **Note on symbols:** as with `prerank`, match your gene identifiers to the
+> library (Enrichr libraries use UPPERCASE human symbols).
+
+
+```python
+# A .cls file labels each sample with its phenotype/class.
+phenoA, phenoB, class_vector = gp.parser.gsea_cls_parser("./tests/extdata/Leukemia.cls")
+```
+
+
+```python
+# class_vector holds the per-sample class label.
+print(class_vector)
+```
+
+
+```python
+# Expression matrix: genes in rows, samples in columns.
+gene_exp = pd.read_csv("./tests/extdata/Leukemia_hgu95av2.trim.txt", sep="\t")
+gene_exp.head()
+```
+
+
+```python
+print("Positively correlated phenotype:", phenoA)
+print("Negatively correlated phenotype:", phenoB)
+```
+
+
+```python
+gs_res = gp.gsea(
+ data=gene_exp, # or a .gct / .txt path
+ gene_sets='./tests/extdata/h.all.v7.0.symbols.gmt', # or an Enrichr library name
+ cls="./tests/extdata/Leukemia.cls", # or cls=class_vector
+ permutation_type='phenotype', # use 'phenotype' when each group has >= 15 samples
+ permutation_num=1000, # reduced for the demo
+ outdir=None,
+ method='signal_to_noise', # ranking metric
+ threads=4,
+ seed=7,
+)
+```
+
+
+You can also use the `GSEA` class directly and set the phenotype labels manually
+via `pheno_pos` / `pheno_neg`.
+
+
+```python
+from gseapy import GSEA
+
+gs = GSEA(
+ data=gene_exp,
+ gene_sets='KEGG_2016',
+ classes=class_vector, # or cls=class_vector
+ permutation_type='phenotype',
+ permutation_num=1000,
+ outdir=None,
+ method='signal_to_noise',
+ threads=4,
+ seed=8,
+)
+gs.pheno_pos = "AML" # name of the positive phenotype
+gs.pheno_neg = "ALL" # name of the negative phenotype
+gs.run()
+```
+
+
+### GSEA plots
+
+The `gsea` module can auto-generate per-set heatmaps in the background. To plot
+yourself, use the snippets below.
+
+
+```python
+# Running enrichment score for the top 5 terms.
+terms = gs_res.res2d.Term
+axs = gs_res.plot(terms[:5], show_ranking=False, legend_kws={'loc': (1.05, 0)})
+```
+
+
+```python
+# Low-level equivalent with gseaplot2:
+# from gseapy import gseaplot2
+# terms = gs_res.res2d.Term[:5]
+# hits = [gs_res.results[t]['hits'] for t in terms]
+# runes = [gs_res.results[t]['RES'] for t in terms]
+# fig = gseaplot2(terms=terms, ress=runes, hits=hits,
+# rank_metric=gs_res.ranking, figsize=(4, 5))
+```
+
+
+```python
+from gseapy import heatmap
+
+# Heatmap of the leading-edge genes for one enriched term.
+i = 2
+genes = gs_res.res2d.Lead_genes[i].split(";")
+# z_score=0 standardizes across rows (genes). Pass ofname='figure.pdf' to save.
+ax = heatmap(df=gs_res.heatmat.loc[genes], z_score=0, title=terms[i], figsize=(14, 4))
+```
+
+
+```python
+# The underlying expression values behind that heatmap.
+gs_res.heatmat.loc[genes]
+```
+
+
+```python
+from gseapy import dotplot
+
+ax = dotplot(
+ gs_res.res2d,
+ column="FDR q-val",
+ title='Hallmark',
+ cmap=plt.cm.viridis,
+ size=5,
+ figsize=(4, 5),
+ cutoff=1, # show all terms (no significance filter)
+)
+```
+
+
+### Command-line equivalent
+
+
+```python
+# !gseapy gsea -d ./tests/extdata/Leukemia_hgu95av2.trim.txt \
+# -g KEGG_2016 -c ./tests/extdata/Leukemia.cls \
+# -o test/gsea_report \
+# -v --no-plot \
+# -t phenotype
+```
+
+
+## Single-sample GSEA (`ssgsea`)
+
+`gp.ssgsea()` scores **each sample independently**, producing an enrichment score
+per gene set per sample — useful when you do not have two phenotype groups to
+contrast.
+
+Not sure whether to use `prerank` or `ssgsea`? See the
+[FAQ](https://github.com/zqfang/GSEApy/wiki/FAQ).
+
+**Accepted `data` inputs**: a `.txt`/`.gct` file, a `DataFrame` (genes × samples),
+or a `Series` indexed by gene. `gene_sets` accepts the usual name / `.gmt` / dict.
+
+
+```python
+ss = gp.ssgsea(
+ data='./tests/extdata/Leukemia_hgu95av2.trim.txt',
+ gene_sets='./tests/extdata/h.all.v7.0.symbols.gmt',
+ outdir=None,
+ sample_norm_method='rank', # 'rank' ranks genes per sample; 'custom' uses raw values
+ no_plot=True,
+)
+```
+
+
+```python
+ss.res2d.head()
+```
+
+
+```python
+# ssGSEA also accepts a DataFrame or Series (gene symbols as the index).
+ssdf = pd.read_csv("./tests/data/temp.rnk", header=None, index_col=0, sep="\t")
+ssdf.head()
+```
+
+
+```python
+# Collapse the single-column DataFrame to a Series.
+ssdf2 = ssdf.squeeze()
+```
+
+
+```python
+# Series / DataFrame input is supported directly.
+temp = gp.ssgsea(data=ssdf2, gene_sets="./tests/data/temp.gmt")
+```
+
+
+### Access the enrichment scores (ES / NES)
+
+Results live on `obj.res2d`. Pivot to a term × sample matrix for downstream use.
+
+
+```python
+ss.res2d.sort_values('Name').head()
+```
+
+
+```python
+# Reshape to NES values, terms in rows and samples in columns.
+nes = ss.res2d.pivot(index='Term', columns='Name', values='NES')
+nes.head()
+```
+
+
+> **Warning:** if you set `permutation_num > 0`, `ssgsea` behaves like `prerank`
+> but with the ssGSEA statistic. **Do not** do this unless you know exactly why
+> you need it.
+>
+> ```python
+> ss_permut = gp.ssgsea(
+> data="./tests/extdata/Leukemia_hgu95av2.trim.txt",
+> gene_sets="./tests/extdata/h.all.v7.0.symbols.gmt",
+> outdir=None,
+> sample_norm_method='rank',
+> permutation_num=20, # > 0 makes it behave like prerank
+> no_plot=True,
+> threads=4, seed=9,
+> )
+> ss_permut.res2d.head(5)
+> ```
+
+### Command-line equivalent
+
+
+```python
+# !gseapy ssgsea -d ./tests/extdata/Leukemia_hgu95av2.trim.txt \
+# -g ./tests/data/temp.gmt \
+# -o test/ssgsea_report \
+# -p 4 --no-plot
+```
+
+
+## Gene Set Variation Analysis (`gsva`)
+
+`gp.gsva()` is GSEApy's port of GSVA — an unsupervised method that turns a
+gene × sample expression matrix into a **gene-set × sample** matrix of enrichment
+scores, with no phenotype labels required.
+
+
+```python
+es = gp.gsva(
+ data='./tests/extdata/Leukemia_hgu95av2.trim.txt',
+ gene_sets='./tests/extdata/h.all.v7.0.symbols.gmt',
+ outdir=None,
+)
+```
+
+
+```python
+# Reshape to a gene-set x sample matrix of GSVA enrichment scores.
+es.res2d.pivot(index='Term', columns='Name', values='ES').head()
+```
+
+
+### Command-line equivalent
+
+
+```python
+# !gseapy gsva -d ./tests/data/expr.gsva.csv \
+# -g ./tests/data/geneset.gsva.gmt \
+# -o test/gsva_report
+```
+
+
+## Replot (`replot`)
+
+`gp.replot()` re-creates GSEA plots from the output of the **Broad Institute's
+Java GSEA** application. It needs the `edb/` folder produced by that tool, with
+this layout:
+
+```
+data/
+└── edb/
+ ├── C1OE.cls
+ ├── gene_sets.gmt
+ ├── gsea_data.gsea_data.rnk
+ └── results.edb
+```
+
+
+```python
+rep = gp.replot(indir="./tests/data", outdir="tests/replot_test")
+```
+
+
+### Command-line equivalent
+
+
+```python
+# !gseapy replot -i data -o test/replot_test
+```
