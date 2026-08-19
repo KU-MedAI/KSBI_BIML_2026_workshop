@@ -38,6 +38,8 @@
 - SciPy
 - Matplotlib
 
+<br>
+
 ## Reference
 
 - **GSEApy Documentation Source** : [GSEApy official tutorial](https://github.com/zqfang/GSEApy/blob/master/docs/gseapy_example.ipynb) 및 GSEApy 1.3.1 runtime API docstring
