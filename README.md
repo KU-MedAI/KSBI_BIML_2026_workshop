@@ -3,6 +3,8 @@
 
 <img width="6000" height="3375" alt="image" src="https://github.com/user-attachments/assets/bb8c394e-6e1a-4b26-9d27-dc6d164195ac" />
 
+<br>
+
 ## Overview
 
 **Title** : Introduction to Agentic AI for Biomedical
@@ -16,6 +18,8 @@
 **TA** : 박자영, 봉현수
 
 **실습 주제** : 대장암 paired bulk RNA-seq 데이터를 활용한 전사체 분석 Agent 및 Agentic Web Platform 구축 실습
+
+<br>
 
 ## Dependency
 
