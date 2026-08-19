@@ -37,3 +37,9 @@
 - pandas
 - SciPy
 - Matplotlib
+
+## Reference
+
+- **GSEApy Documentation Source** : [GSEApy official tutorial](https://github.com/zqfang/GSEApy/blob/master/docs/gseapy_example.ipynb) 및 GSEApy 1.3.1 runtime API docstring
+
+- **Practice Data Source** : [NCBI GEO GSE95132](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE95132), Hanley MP et al., *Oncogene* (2017), [DOI: 10.1038/onc.2017.130](https://doi.org/10.1038/onc.2017.130)
